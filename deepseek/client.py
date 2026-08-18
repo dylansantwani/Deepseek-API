@@ -44,6 +44,25 @@ DEFAULT_MODEL_TYPE = "default"
 _CID_SEP = ":"
 
 
+class UpstreamError(RuntimeError):
+    """An error DeepSeek reported inside the completion stream.
+
+    The stream carries failures as an `event: hint` frame rather than an HTTP
+    status, e.g. {"type": "error", "content": "Messages too frequent. Try again
+    later.", "finish_reason": "rate_limit_reached"}. Dropping those frames turns
+    a rate limit into a silent empty reply, which the caller can only report as
+    "the model returned nothing" -- no reason to show, nothing to back off from.
+    """
+
+    def __init__(self, message: str, finish_reason: str = ""):
+        super().__init__(message or "DeepSeek reported an error")
+        self.finish_reason = finish_reason or ""
+
+    @property
+    def is_rate_limit(self) -> bool:
+        return "rate_limit" in self.finish_reason.lower()
+
+
 def _encode_cid(session_id: str, message_id: Optional[int]) -> str:
     if message_id is None:
         return session_id
@@ -258,6 +277,10 @@ def _parse_sse(lines, meta: Optional[dict] = None) -> Iterator[str]:
             obj = json.loads(payload)
         except json.JSONDecodeError:
             continue
+
+        if obj.get("type") == "error" or obj.get("finish_reason") == "rate_limit_reached":
+            raise UpstreamError(str(obj.get("content") or "").strip(),
+                                str(obj.get("finish_reason") or ""))
 
         v = obj.get("v")
 

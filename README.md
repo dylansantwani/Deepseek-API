@@ -301,6 +301,36 @@ needed; the upstream client is faked).
 
 ---
 
+## Upstream errors
+
+DeepSeek reports failures inside the completion stream as an `event: hint`
+frame, not an HTTP status:
+
+```
+event: hint
+data: {"type":"error","content":"Messages too frequent. Try again later.",
+       "finish_reason":"rate_limit_reached"}
+```
+
+Those frames are surfaced rather than dropped, because a dropped one becomes a
+`200` with empty content — indistinguishable from the model having nothing to
+say, with no reason to show and nothing for a client to back off from.
+
+| Upstream | Response |
+| --- | --- |
+| `rate_limit_reached` | `429` + `Retry-After` (`UPSTREAM_RETRY_AFTER`, default 30) |
+| any other error frame | `502` with the upstream message |
+
+Streaming requests get the same status: the first delta is pulled before the
+response starts, so an error still lands as a status code rather than arriving
+mid-body after a `200`.
+
+Note this is DeepSeek's own per-account limit on the web chat, separate from
+this server's `RATE_LIMIT_PER_MINUTE`. Agent loops are the usual way to hit it —
+each tool round trip is another completion.
+
+---
+
 ## Concurrency
 
 The server bridges a **single** signed-in DeepSeek account behind one shared

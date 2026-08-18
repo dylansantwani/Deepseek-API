@@ -33,7 +33,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from deepseek.auth import LoginRequired
-from deepseek.client import DeepSeekClient
+from deepseek.client import DeepSeekClient, UpstreamError
 
 from .config import (
     MODEL_MAP,
@@ -63,6 +63,8 @@ log = logging.getLogger("uvicorn.error")
 # at all, which is the difference between "bridge ignored them" and "client
 # never offered them".
 DEBUG_REQUESTS = os.getenv("DEBUG_REQUESTS", "").lower() in ("1", "true", "yes", "on")
+# Seconds to advertise in Retry-After when DeepSeek rate-limits us.
+UPSTREAM_RETRY_AFTER = os.getenv("UPSTREAM_RETRY_AFTER", "30")
 
 app = FastAPI(title="DeepSeek OpenAI-compatible API", version="0.1.0")
 install_rate_limit(app, RateLimiter(limit=RATE_LIMIT_PER_MINUTE, window=60.0))
@@ -92,11 +94,47 @@ def get_client() -> DeepSeekClient:
     return _client
 
 
-def _error(message: str, status: int = 500, err_type: str = "server_error"):
+def _error(message: str, status: int = 500, err_type: str = "server_error",
+           headers: dict = None):
     return JSONResponse(
         status_code=status,
         content={"error": {"message": message, "type": err_type}},
+        headers=headers or None,
     )
+
+
+def _upstream_error(exc: UpstreamError):
+    """Map a DeepSeek stream error onto the status a client can act on.
+
+    A rate limit must be a 429 with Retry-After: OpenAI-compatible clients back
+    off and retry on that, whereas a 200 with empty content just looks like the
+    model had nothing to say.
+    """
+    if exc.is_rate_limit:
+        return _error(str(exc), status=429, err_type="rate_limit_exceeded",
+                      headers={"Retry-After": UPSTREAM_RETRY_AFTER})
+    return _error(f"DeepSeek reported: {exc}", status=502, err_type="upstream_error")
+
+
+class _Prefetched:
+    """A stream with its first delta already pulled.
+
+    The endpoint consumes one delta before returning a response, so an error
+    frame -- which DeepSeek sends immediately -- becomes a real status code
+    instead of a 200 whose body turns out to be an error mid-flight.
+    """
+
+    def __init__(self, stream, first):
+        self._stream, self._first = stream, first
+
+    def __iter__(self):
+        if self._first is not None:
+            yield self._first
+        yield from self._stream
+
+    @property
+    def conversation_id(self):
+        return getattr(self._stream, "conversation_id", None)
 
 
 @app.get("/healthz")
@@ -152,11 +190,20 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(f"Failed to initialise DeepSeek session: {e}")
 
     if req.stream:
+        raw = client.stream(
+            prompt, conversation_id=req.conversation_id,
+            model=model_type, thinking=req.thinking, search=req.search,
+        )
+        it = iter(raw)
+        try:
+            first = await run_in_threadpool(lambda: next(it, None))
+        except UpstreamError as e:
+            return _upstream_error(e)
+        except Exception as e:
+            return _error(f"DeepSeek request failed: {e}")
+
         def gen():
-            stream = client.stream(
-                prompt, conversation_id=req.conversation_id,
-                model=model_type, thinking=req.thinking, search=req.search,
-            )
+            stream = _Prefetched(raw, first)
             if tools:
                 yield from stream_chunks_with_tools(req.model, stream, tools)
             else:
@@ -169,6 +216,8 @@ async def chat_completions(req: ChatCompletionRequest):
             client.chat, prompt, req.conversation_id,
             model_type, req.thinking, req.search,
         )
+    except UpstreamError as e:
+        return _upstream_error(e)
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 

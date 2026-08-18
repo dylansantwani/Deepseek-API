@@ -469,3 +469,60 @@ def test_bare_object_with_arguments_is_a_call():
     calls, _ = extract_tool_calls(
         '{"name": "browser_navigate", "arguments": {"url": "https://a.com"}}', TOOLS)
     assert _names(calls) == ["browser_navigate"]
+
+
+# --- upstream errors must not look like an empty reply ---------------------
+
+def test_stream_error_frame_raises_instead_of_yielding_nothing():
+    from deepseek.client import _parse_sse
+    from deepseek import UpstreamError
+    frames = ['data: {"type":"error","content":"Messages too frequent. Try again '
+              'later.","finish_reason":"rate_limit_reached"}']
+    try:
+        list(_parse_sse(iter(frames)))
+    except UpstreamError as exc:
+        assert exc.is_rate_limit
+        assert "too frequent" in str(exc)
+    else:
+        raise AssertionError("rate-limit frame was swallowed")
+
+
+def test_normal_stream_frames_still_parse():
+    from deepseek.client import _parse_sse
+    frames = ['data: {"p":"response/fragments/-1/content","o":"APPEND","v":"hi"}',
+              'data: {"v":" there"}']
+    assert list(_parse_sse(iter(frames))) == ["hi", " there"]
+
+
+def _erroring_client(exc):
+    class _C:
+        def chat(self, *a, **k):
+            raise exc
+
+        def stream(self, *a, **k):
+            def g():
+                raise exc
+                yield  # pragma: no cover
+            return g()
+    api.get_client = lambda: _C()
+    return TestClient(api.app, raise_server_exceptions=False)
+
+
+def test_rate_limit_becomes_429_with_retry_after():
+    from deepseek import UpstreamError
+    c = _erroring_client(UpstreamError("Messages too frequent.", "rate_limit_reached"))
+    for stream in (False, True):
+        r = c.post("/v1/chat/completions", json={
+            "model": "deepseek-chat", "stream": stream,
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 429, (stream, r.status_code)
+        assert r.headers.get("Retry-After")
+        assert r.json()["error"]["type"] == "rate_limit_exceeded"
+
+
+def test_other_upstream_errors_become_502():
+    from deepseek import UpstreamError
+    c = _erroring_client(UpstreamError("Something broke upstream.", "server_error"))
+    r = c.post("/v1/chat/completions", json={
+        "model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 502
