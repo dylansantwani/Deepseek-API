@@ -21,6 +21,9 @@ RATE_LIMIT_PER_MINUTE); /healthz is exempt.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import threading
 import time
 
@@ -39,11 +42,26 @@ from .config import (
     is_known_model,
     resolve_model_type,
 )
-from .openai_format import completion_response, messages_to_prompt, stream_chunks
+from .openai_format import (
+    completion_response,
+    extract_tool_calls,
+    messages_to_prompt,
+    stream_chunks,
+    stream_chunks_with_tools,
+)
 from .ratelimit import RateLimiter, install_rate_limit
 from .schemas import ChatCompletionRequest
 
 load_dotenv()
+
+# uvicorn configures logging with disable_existing_loggers, so hang our
+# debug output off its own logger to be sure it reaches the console.
+log = logging.getLogger("uvicorn.error")
+# Set DEBUG_REQUESTS=1 to log each request's shape (roles + tool names). Useful
+# when a client's tool calls aren't arriving: it shows whether `tools` was sent
+# at all, which is the difference between "bridge ignored them" and "client
+# never offered them".
+DEBUG_REQUESTS = os.getenv("DEBUG_REQUESTS", "").lower() in ("1", "true", "yes", "on")
 
 app = FastAPI(title="DeepSeek OpenAI-compatible API", version="0.1.0")
 install_rate_limit(app, RateLimiter(limit=RATE_LIMIT_PER_MINUTE, window=60.0))
@@ -112,7 +130,16 @@ async def chat_completions(req: ChatCompletionRequest):
     # A thread's model is fixed when it's created, so on resume we ignore `model`
     # (the OpenAI SDK always sends one) and let the existing thread's model stand.
     model_type = None if req.conversation_id else resolve_model_type(req.model)
-    prompt = messages_to_prompt(req.messages)
+    if DEBUG_REQUESTS:
+        log.warning("request: model=%s stream=%s roles=%s tools=%s tool_choice=%s",
+                    req.model, req.stream, [m.role for m in req.messages],
+                    [ (t.get("function") or t).get("name") for t in (req.tools or []) ],
+                    req.tool_choice)
+
+    prompt = messages_to_prompt(req.messages, req.tools, req.tool_choice)
+    # DeepSeek has no native tool channel; `tools` are emulated in the prompt
+    # and parsed back out of the reply. `tool_choice: none` means don't offer.
+    tools = None if req.tool_choice == "none" else req.tools
 
     try:
         # Off the event loop: get_client() uses Playwright's sync API, which
@@ -129,7 +156,10 @@ async def chat_completions(req: ChatCompletionRequest):
                 prompt, conversation_id=req.conversation_id,
                 model=model_type, thinking=req.thinking, search=req.search,
             )
-            yield from stream_chunks(req.model, stream)
+            if tools:
+                yield from stream_chunks_with_tools(req.model, stream, tools)
+            else:
+                yield from stream_chunks(req.model, stream)
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -141,4 +171,6 @@ async def chat_completions(req: ChatCompletionRequest):
     except Exception as e:
         return _error(f"DeepSeek request failed: {e}")
 
-    return completion_response(req.model, reply.text, prompt, reply.conversation_id)
+    calls, text = extract_tool_calls(reply.text, tools)
+    return completion_response(req.model, text, prompt, reply.conversation_id,
+                               tool_calls=calls)

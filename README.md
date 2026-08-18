@@ -23,6 +23,7 @@ You sign in once in a browser with your DeepSeek account; your session is saved 
 - [Command line](#command-line)
 - [Human-check & proof-of-work (automatic)](#human-check--proof-of-work-automatic)
 - [Models, DeepThink & web search](#models-deepthink--web-search)
+- [Tool calling (function calling)](#tool-calling-function-calling)
 - [Concurrency](#concurrency)
 - [Rate limiting](#rate-limiting)
 - [Project layout](#project-layout)
@@ -217,6 +218,61 @@ resp = client.chat.completions.create(
 model is fixed at creation, so `model` can't be combined with `conversation_id`
 on resume. Unknown model names return a `404` (no silent fallback). See
 [server/config.py](server/config.py).
+
+---
+
+## Tool calling (function calling)
+
+The server accepts OpenAI-style `tools` and returns `tool_calls`, so agent
+frameworks that drive a tool loop work against it:
+
+```python
+resp = client.chat.completions.create(
+    model="deepseek-chat",
+    messages=[{"role": "user", "content": "What's the weather in Paris?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Current weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }],
+)
+call = resp.choices[0].message.tool_calls[0]   # finish_reason == "tool_calls"
+print(call.function.name, call.function.arguments)
+```
+
+Send the result back as a `tool` message (with the matching `tool_call_id`) and
+the conversation continues as it would against OpenAI.
+
+**This is emulated, not native.** DeepSeek's web chat has no function-calling
+channel, so the bridge puts the tool schemas into the prompt with a strict
+output contract and parses the model's JSON reply back into `tool_calls`. That
+has consequences worth knowing:
+
+- **It's best-effort.** A prompt is not a decoder constraint. Complex or deeply
+  nested parameter schemas are where it frays first.
+- **Hallucinated tools are dropped.** A call naming a tool you didn't offer is
+  returned as ordinary text, never as a `tool_call`.
+- **Prose calls are salvaged.** Replies that narrate the call ReAct-style
+  (`Action: some_tool` / `Action Input: {...}`) are parsed into real calls
+  anyway, including when the model drops a namespace prefix.
+- **`tool_choice`** supports `"none"`, `"required"`, and pinning a named
+  function.
+- **Streaming buffers.** A tool call is only recognisable once its JSON is
+  complete, so tool-enabled streaming requests emit one delta instead of
+  token-by-token output. Requests without `tools` stream as before.
+
+Set `DEBUG_REQUESTS=1` to log each request's message roles and offered tool
+names — the quickest way to tell whether a client actually sent `tools`.
+
+Tests: `python -m pytest tests/test_tool_calling.py` (no DeepSeek session
+needed; the upstream client is faked).
 
 ---
 
