@@ -189,3 +189,90 @@ def test_tool_choice_none_suppresses_tools():
         "messages": [{"role": "user", "content": "hi"}],
     }).json()["choices"][0]
     assert choice["finish_reason"] == "stop"
+
+
+# --- parser robustness: the shapes that leaked in real use -----------------
+
+def test_braces_inside_a_string_value_do_not_break_balance():
+    # A quote-blind brace scanner mis-counts here and leaks the call as text.
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"browser_navigate",'
+        '"arguments":{"url":"https://x.com/?q={a}","note":"hi {name}, bye}"}}]}', TOOLS)
+    assert _args(calls)["url"] == "https://x.com/?q={a}"
+    assert _args(calls)["note"] == "hi {name}, bye}"
+
+
+def test_escapes_inside_string_values():
+    # Build it with json.dumps so the escaping is the real thing, not a
+    # hand-written literal: quotes and backslashes inside a value must not be
+    # mistaken for the end of the string while scanning for the closing brace.
+    tricky = 'say "hi" \\ then {x}'
+    payload = json.dumps({"tool_calls": [
+        {"name": "browser_navigate", "arguments": {"url": tricky}}]})
+    calls, _ = extract_tool_calls(payload, TOOLS)
+    assert _args(calls)["url"] == tricky
+
+
+def test_unclosed_fence_still_parses():
+    calls, _ = extract_tool_calls(
+        '```json\n{"tool_calls":[{"name":"browser_navigate",'
+        '"arguments":{"url":"https://a.com"}}]}', TOOLS)
+    assert _args(calls)["url"] == "https://a.com"
+
+
+def test_truncated_reply_is_repaired_structurally():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"browser_navigate","arguments":{"url":"https://a.com","depth":', TOOLS)
+    assert _args(calls)["url"] == "https://a.com"
+
+
+def test_truncated_value_is_dropped_not_guessed():
+    # `1514652929` cut to `15` would parse and point somewhere else entirely.
+    # A missing argument fails loudly; a wrong one gets acted on.
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"browser_navigate","arguments":{"url":"https://a.com","tabId":15', TOOLS)
+    assert "tabId" not in _args(calls)
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"browser_navigate","arguments":{"url":"https://a.com","note":"half wri', TOOLS)
+    assert "note" not in _args(calls)
+
+
+# --- call-syntax dialect (what the expert model emits) ---------------------
+
+def test_function_call_syntax_is_parsed():
+    calls, left = extract_tool_calls('browser_navigate({"url": "https://a.com"})', TOOLS)
+    assert _names(calls) == ["browser_navigate"]
+    assert _args(calls)["url"] == "https://a.com"
+    assert left == ""
+
+
+def test_call_syntax_with_surrounding_prose():
+    calls, _ = extract_tool_calls(
+        'Let me check.\nbrowser_navigate({"url": "https://a.com"})\nOne moment.', TOOLS)
+    assert _args(calls)["url"] == "https://a.com"
+
+
+def test_call_syntax_no_arguments():
+    calls, _ = extract_tool_calls("browser_navigate()", TOOLS)
+    assert _args(calls) == {}
+
+
+def test_call_syntax_resolves_dropped_namespace():
+    calls, _ = extract_tool_calls('browser_navigate({"url": "https://a.com"})', MCP_TOOLS)
+    assert _names(calls) == ["mcp__openbrowser__browser_navigate"]
+
+
+def test_call_syntax_ignores_unoffered_tools_and_plain_prose():
+    assert extract_tool_calls('delete_everything({"path": "/"})', TOOLS)[0] is None
+    assert extract_tool_calls("I read the file (the one you named) and it says hi.", TOOLS)[0] is None
+
+
+def test_prompt_forbids_announcing_and_puts_contract_last():
+    prompt = messages_to_prompt(
+        [ChatMessage(role="system", content="You are helpful."),
+         ChatMessage(role="user", content="read a file")], TOOLS)
+    assert "NEVER announce" in prompt
+    # The contract must sit next to the generation point, not above the chat:
+    # leading with it is what made the expert model announce instead of call.
+    assert prompt.index("browser_navigate") > prompt.index("You are helpful.")
+    assert prompt.rstrip().endswith("Assistant:")

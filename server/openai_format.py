@@ -41,10 +41,14 @@ no prose before it, no explanation after it, in exactly this shape:
 Rules, all of them mandatory:
 - Use ONLY tool names from the list. Never invent a tool that is not listed.
 - `arguments` must be a JSON object matching that tool's parameter schema.
-- NEVER write a call as prose. Lines like "Action: some_tool" or
-  "Action Input: {...}" are not tool calls and do nothing.
+- NEVER write a call as prose or as code. Lines like "Action: some_tool",
+  "Action Input: {...}", or `some_tool({"arg": "value"})` are not tool calls
+  and do nothing. Only the JSON object above is a tool call.
 - NEVER write out, guess, or imagine a tool's result. Stop after the JSON; the
   real result comes back to you in the next turn.
+- NEVER announce a call in words. "I'll read the file now", "Let me check
+  that", "First I need to open it" — these do nothing, and the turn ends there.
+  If you intend to use a tool, the JSON object IS your entire reply, right now.
 - When you are done using tools and want to answer the user, reply with normal
   text and no JSON block.
 
@@ -146,9 +150,6 @@ def messages_to_prompt(messages: List[ChatMessage], tools=None,
         return _text_of(messages[0].content)
 
     lines = []
-    if preamble:
-        lines.append(preamble)
-
     for m in messages:
         if m.role == "tool":
             # The answer to a call we made. Label it with the tool's name when
@@ -163,6 +164,13 @@ def messages_to_prompt(messages: List[ChatMessage], tools=None,
             calls = _render_assistant_tool_calls(m.tool_calls)
             body = f"{body}\n{calls}".strip() if body else calls
         lines.append(f"{label}: {body}")
+
+    # The contract goes LAST, immediately before the generation point. Leading
+    # with it loses to the conversation that follows: the expert model in
+    # particular would answer "I'll read the file now" and stop, announcing a
+    # call instead of emitting one.
+    if preamble:
+        lines.append(preamble)
 
     lines.append("Assistant:")
     return "\n\n".join(lines)
@@ -196,6 +204,51 @@ def _resolve_name(name: str, allowed: List[str]) -> Optional[str]:
     return hits[0] if len(hits) == 1 else None
 
 
+# Second salvage path: `tool_name({"arg": "value"})` call syntax, which the
+# expert model reaches for in preference to a JSON object. The name is only
+# accepted if it resolves to a tool that was actually offered, so this can't
+# turn ordinary prose containing parentheses into a call.
+_CALL_SYNTAX_RE = re.compile(r"([A-Za-z_][\w.\-]*)\s*\(\s*(?=[{)])")
+
+
+def _extract_call_syntax(text: str, allowed: List[str]) -> Tuple[Optional[List[dict]], str]:
+    """Parse `tool_name({...})` / `tool_name()` invocations into tool calls."""
+    calls, spans = [], []
+    for m in _CALL_SYNTAX_RE.finditer(text):
+        name = _resolve_name(m.group(1), allowed)
+        if not name:
+            continue
+        end = m.end()
+        if text[end:end + 1] == ")":          # no-argument call
+            args = {}
+            end += 1
+        else:
+            obj, partial = _scan_object(text, end)
+            if not obj:
+                obj = _repair_truncated(partial or "") or ""
+            try:
+                args = json.loads(obj)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(args, dict):
+                continue
+            end += len(obj)
+            if text[end:end + 1] == ")":
+                end += 1
+        calls.append({
+            "id": "call_" + uuid.uuid4().hex[:24],
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+        spans.append((m.start(), end))
+    if not calls:
+        return None, text
+    leftover = text
+    for start, stop in reversed(spans):
+        leftover = leftover[:start] + leftover[stop:]
+    return calls, leftover.strip()
+
+
 def _extract_react_calls(text: str, allowed: List[str]) -> Tuple[Optional[List[dict]], str]:
     """Parse ReAct-style `Action:` / `Action Input:` prose into tool calls."""
     calls, spans = [], []
@@ -223,24 +276,118 @@ def _extract_react_calls(text: str, allowed: List[str]) -> Tuple[Optional[List[d
     return calls, leftover.strip()
 
 
+def _scan_object(text: str, start: int) -> Tuple[Optional[str], Optional[str]]:
+    """Scan one JSON object starting at `text[start]` == '{'.
+
+    Returns (complete, partial): `complete` is the balanced object if one closes,
+    otherwise `partial` is the truncated remainder (for the repair path below).
+
+    Brace counting MUST ignore braces inside string literals. A quote-blind
+    scanner mis-balances on ordinary payloads — `{"text": "hi {name}"}` — and
+    the tool call leaks to the caller as raw JSON text.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1], None
+    return None, text[start:]
+
+
+def _repair_truncated(fragment: str) -> Optional[str]:
+    """Close a cut-off JSON object so it can be parsed, or None.
+
+    A reply can end mid-object (upstream cut, length cap). The fragment is still
+    a real tool call the caller should get, so we balance the open brackets.
+
+    We never complete a truncated VALUE. `"tabId": 15` cut from `1514652929`
+    parses fine and points at a different tab — a wrong argument is worse than a
+    missing one, because the caller acts on it instead of erroring. So a
+    half-written value is dropped along with its key, and a tool left missing a
+    required argument fails loudly where it belongs.
+    """
+    if '"tool_calls"' not in fragment and '"name"' not in fragment:
+        return None
+
+    stack = []
+    in_string = False
+    escaped = False
+    for ch in fragment:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+    if not stack:
+        return None
+
+    repaired = fragment
+    if in_string:
+        # Cut inside a string: drop the whole "key": "half-written pair.
+        opening = repaired.rfind('"')
+        repaired = repaired[:opening]
+        repaired = re.sub(r',?\s*"[^"]*"\s*:\s*$', "", repaired)
+    else:
+        # Cut inside a bare literal (number/true/null) or right after a key.
+        repaired = re.sub(r',?\s*"[^"]*"\s*:\s*(?:-?\d+(?:\.\d*)?(?:[eE][-+]?\d*)?'
+                          r'|t(?:r(?:u(?:e)?)?)?|f(?:a(?:l(?:s(?:e)?)?)?)?'
+                          r'|n(?:u(?:l(?:l)?)?)?)?$', "", repaired)
+    repaired = re.sub(r",\s*$", "", repaired)
+    for opener in reversed(stack):
+        repaired += "}" if opener == "{" else "]"
+    return repaired
+
+
 def _iter_json_candidates(text: str) -> Iterable[str]:
     """Yield substrings of `text` that might be the tool-call JSON object.
 
-    Fenced blocks first (what we asked for), then any brace-balanced object in
-    the raw text (what we sometimes get).
+    Fenced blocks first (what we asked for), then any string-aware balanced
+    object in the raw text, then a repaired tail if the reply was cut off.
     """
     for m in _FENCE_RE.finditer(text):
         yield m.group(1)
-    depth, start = 0, None
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}" and depth:
-            depth -= 1
-            if depth == 0 and start is not None:
-                yield text[start:i + 1]
+    partials = []
+    i = 0
+    while i < len(text):
+        if text[i] == "{":
+            complete, partial = _scan_object(text, i)
+            if complete:
+                yield complete
+                i += len(complete)
+                continue
+            if partial:
+                partials.append(partial)
+            break
+        i += 1
+    for partial in partials:
+        repaired = _repair_truncated(partial)
+        if repaired:
+            yield repaired
 
 
 def _normalise_calls(obj, allowed: List[str]) -> Optional[List[dict]]:
@@ -308,7 +455,10 @@ def extract_tool_calls(text: str, tools) -> Tuple[Optional[List[dict]], str]:
             leftover = text.replace(candidate, "", 1)
             leftover = _FENCE_RE.sub("", leftover).strip()
             return calls, leftover
-    return _extract_react_calls(text, allowed)
+    calls, leftover = _extract_react_calls(text, allowed)
+    if calls:
+        return calls, leftover
+    return _extract_call_syntax(text, allowed)
 
 
 def _now() -> int:

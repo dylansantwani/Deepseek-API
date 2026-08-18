@@ -259,9 +259,16 @@ has consequences worth knowing:
   nested parameter schemas are where it frays first.
 - **Hallucinated tools are dropped.** A call naming a tool you didn't offer is
   returned as ordinary text, never as a `tool_call`.
-- **Prose calls are salvaged.** Replies that narrate the call ReAct-style
-  (`Action: some_tool` / `Action Input: {...}`) are parsed into real calls
-  anyway, including when the model drops a namespace prefix.
+- **Other call dialects are salvaged.** Models don't reliably follow the
+  contract, so replies that narrate the call ReAct-style (`Action: some_tool` /
+  `Action Input: {...}`) or write it as code (`some_tool({"arg": 1})`) are
+  parsed into real calls anyway, including when the model drops a namespace
+  prefix. `deepseek-expert` prefers the code form.
+- **Truncated replies are repaired structurally, never by guessing.** A cut-off
+  object is closed so it can be parsed, but a half-written *value* is dropped
+  with its key: `"tabId": 15` truncated from `1514652929` parses cleanly and
+  points at the wrong thing, and a missing argument that errors is better than a
+  wrong one that gets acted on.
 - **`tool_choice`** supports `"none"`, `"required"`, and pinning a named
   function.
 - **Streaming buffers.** A tool call is only recognisable once its JSON is
