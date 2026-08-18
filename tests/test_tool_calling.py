@@ -66,11 +66,15 @@ def test_plain_answer_is_not_a_tool_call():
     assert calls is None and left == "YouTube is a video site."
 
 
-def test_unoffered_tool_is_rejected():
-    # The regression that started this: models invent tools that don't exist.
+def test_explicit_envelope_passes_unknown_names_through():
+    # Clients with lazy tool loading (a tool-search step, MCP servers resolved
+    # on demand) call tools that aren't in this request's `tools` array. The
+    # envelope makes the intent unambiguous, so the call goes through and the
+    # client resolves it -- reporting an unknown tool cleanly if it can't.
     calls, _ = extract_tool_calls(
-        '{"tool_calls":[{"name":"browser_get_all_pages","arguments":{}}]}', TOOLS)
-    assert calls is None
+        '{"tool_calls":[{"name":"mcp__openbrowser__browser_tabs",'
+        '"arguments":{"action":"list"}}]}', TOOLS)
+    assert _names(calls) == ["mcp__openbrowser__browser_tabs"]
 
 
 def test_react_prose_is_salvaged():
@@ -87,6 +91,15 @@ def test_react_prose_resolves_a_dropped_namespace_prefix():
     calls, _ = extract_tool_calls(
         'Action: browser_navigate\nAction Input: {"url": "https://x.com"}', MCP_TOOLS)
     assert _names(calls) == ["mcp__openbrowser__browser_navigate"]
+
+
+def test_heuristic_paths_stay_strict_about_names():
+    # Prose/code/XML salvage has no envelope to signal intent, so a known name
+    # is the only thing separating a real call from ordinary text.
+    for text in ('Action: made_up_tool Action Input: {"x": 1}',
+                 'made_up_tool({"x": 1})',
+                 '<made_up_tool x="1">'):
+        assert extract_tool_calls(text, TOOLS)[0] is None
 
 
 def test_react_prose_for_an_unoffered_tool_stays_text():
@@ -280,10 +293,17 @@ def test_prompt_forbids_announcing_and_puts_contract_last():
 
 # --- batches: one bad entry must not sink the valid ones -------------------
 
-def test_batch_keeps_valid_calls_when_one_name_is_invented():
+def test_batch_keeps_every_well_formed_call():
     calls, _ = extract_tool_calls(
         '{"tool_calls":[{"name":"browser_navigate","arguments":{"url":"https://a.com"}},'
         '{"name":"browser_get_all_pages","arguments":{}}]}', TOOLS)
+    assert _names(calls) == ["browser_navigate", "browser_get_all_pages"]
+
+
+def test_batch_drops_only_structurally_broken_entries():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"browser_navigate","arguments":{"url":"https://a.com"}},'
+        '{"arguments":{"no":"name"}},"not-an-object"]}', TOOLS)
     assert _names(calls) == ["browser_navigate"]
 
 
@@ -294,8 +314,8 @@ def test_batch_keeps_valid_calls_when_the_tail_is_truncated():
     assert _names(calls) == ["browser_navigate"]
 
 
-def test_batch_of_only_invalid_calls_stays_text():
-    calls, _ = extract_tool_calls('{"tool_calls":[{"name":"nope","arguments":{}}]}', TOOLS)
+def test_batch_with_no_usable_entries_stays_text():
+    calls, _ = extract_tool_calls('{"tool_calls":[{"arguments":{}},{"no":"name"}]}', TOOLS)
     assert calls is None
 
 
@@ -363,10 +383,17 @@ def test_deeply_nested_wrappers_are_unwrapped():
     assert _names(calls) == ["browser_navigate"]
 
 
-def test_wrapper_around_an_unoffered_tool_stays_text():
+def test_wrapper_around_an_unknown_tool_still_unwraps_to_the_inner_name():
+    # The wrapper itself is never the call; the inner name is, known or not.
     calls, _ = extract_tool_calls(
         '{"tool_calls":[{"name":"tool_call","arguments":'
-        '{"name":"delete_everything","arguments":{}}}]}', TOOLS)
+        '{"name":"mcp__openbrowser__browser_snapshot","arguments":{}}}]}', TOOLS)
+    assert _names(calls) == ["mcp__openbrowser__browser_snapshot"]
+
+
+def test_wrapper_with_no_inner_name_is_not_a_call():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"tool_call","arguments":{"foo":"bar"}}]}', TOOLS)
     assert calls is None
 
 

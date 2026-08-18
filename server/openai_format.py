@@ -14,6 +14,8 @@ some_tool ...") and the caller sees text where it expected a tool call.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import time
 import uuid
@@ -458,7 +460,8 @@ def _iter_json_candidates(text: str) -> Iterable[str]:
 _WRAPPER_NAMES = ("tool_call", "tool", "function", "function_call", "invoke", "call")
 
 
-def _unwrap_call(fn: dict, allowed: List[str], depth: int = 0) -> Optional[dict]:
+def _unwrap_call(fn: dict, allowed: List[str], depth: int = 0,
+                 strict: bool = True) -> Optional[dict]:
     """Peel generic wrappers off a call entry until the real one is found.
 
     Models sometimes echo the protocol's own vocabulary as the tool name and
@@ -483,20 +486,33 @@ def _unwrap_call(fn: dict, allowed: List[str], depth: int = 0) -> Optional[dict]
     resolved = _resolve_name(name, allowed) if allowed else name
     # A nested call wins over a wrapper name, even one that happens to resolve.
     if isinstance(args.get("name"), str) and (not resolved or name.lower() in _WRAPPER_NAMES):
-        inner = _unwrap_call(args, allowed, depth + 1)
+        inner = _unwrap_call(args, allowed, depth + 1, strict)
         if inner:
             return inner
     if not resolved:
-        return None
+        if strict or name.lower() in _WRAPPER_NAMES:
+            return None
+        # Non-strict: the model wrote an explicit call envelope for a name we
+        # can't match. Clients with lazy tool loading (a tool-search step, MCP
+        # servers resolved on demand) legitimately call tools that aren't in
+        # this request's `tools` array, so passing the call through is right --
+        # the client owns resolution and reports an unknown tool cleanly. The
+        # alternative is dumping raw JSON at the user, which is strictly worse.
+        resolved = name
     return {"name": resolved, "arguments": args}
 
 
-def _normalise_calls(obj, allowed: List[str]) -> Optional[List[dict]]:
+def _normalise_calls(obj, allowed: List[str], strict: bool = True) -> Optional[List[dict]]:
     """Pull a list of {name, arguments} out of a parsed JSON object, or None.
 
     Lenient about the wrapper (`tool_calls`, `tool_call`, or a bare call) because
-    the model is not a schema-constrained decoder. Strict about the names: a call
-    to a tool that wasn't offered is a hallucination, not a call.
+    the model is not a schema-constrained decoder.
+
+    `strict` controls unknown names. Heuristic salvage paths (prose, call syntax,
+    XML) pass strict=True: there, a known name is the only thing separating a
+    real call from ordinary text. An explicit `{"tool_calls": [...]}` envelope
+    passes strict=False, because the intent to call is unambiguous and the name
+    may simply not be in this request's `tools` array.
     """
     if isinstance(obj, dict):
         raw = obj.get("tool_calls") or obj.get("tool_call") or obj
@@ -515,7 +531,7 @@ def _normalise_calls(obj, allowed: List[str]) -> Optional[List[dict]]:
         if not isinstance(item, dict):
             continue
         fn = item.get("function") if isinstance(item.get("function"), dict) else item
-        unwrapped = _unwrap_call(fn, allowed)
+        unwrapped = _unwrap_call(fn, allowed, strict=strict)
         if not unwrapped:
             continue
         name, args = unwrapped["name"], unwrapped["arguments"]
@@ -544,7 +560,7 @@ def extract_tool_calls(text: str, tools) -> Tuple[Optional[List[dict]], str]:
             obj = json.loads(candidate)
         except (ValueError, TypeError):
             continue
-        calls = _normalise_calls(obj, allowed)
+        calls = _normalise_calls(obj, allowed, strict=False)
         if calls:
             leftover = text.replace(candidate, "", 1)
             leftover = _FENCE_RE.sub("", leftover).strip()
@@ -653,6 +669,11 @@ def stream_chunks_with_tools(model: str, stream: Iterable[str], tools) -> Iterab
     buf = "".join(d for d in stream if d)
     conversation_id = getattr(stream, "conversation_id", None)
     calls, leftover = extract_tool_calls(buf, tools)
+    if os.getenv("DEBUG_REQUESTS", "").lower() in ("1", "true", "yes", "on"):
+        logging.getLogger("uvicorn.error").warning(
+            "reply(stream): calls=%s text=%r",
+            [(c["function"]["name"], c["function"]["arguments"]) for c in calls or []],
+            (leftover or buf)[:200])
 
     if calls:
         delta = {"tool_calls": [

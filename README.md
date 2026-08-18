@@ -257,9 +257,13 @@ has consequences worth knowing:
 
 - **It's best-effort.** A prompt is not a decoder constraint. Complex or deeply
   nested parameter schemas are where it frays first.
-- **Hallucinated tools are dropped, individually.** A call naming a tool you
-  didn't offer is returned as ordinary text, never as a `tool_call` — but only
-  that call. In a batch, the valid calls beside it still come through.
+- **Unknown tool names in an explicit `{"tool_calls": ...}` envelope are passed
+  through.** Clients with lazy tool loading (a tool-search step, MCP servers
+  resolved on demand) legitimately call tools that aren't in the request's
+  `tools` array, so the call goes to the client to resolve — it reports an
+  unknown tool cleanly, whereas dumping raw JSON at the user does not. The
+  heuristic salvage paths below stay strict: with no envelope to signal intent,
+  a known name is the only thing separating a call from ordinary prose.
 - **Other call dialects are salvaged.** Models don't reliably follow the
   contract, so replies that narrate the call ReAct-style (`Action: some_tool` /
   `Action Input: {...}`) or write it as code (`some_tool({"arg": 1})`) are

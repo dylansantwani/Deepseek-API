@@ -172,5 +172,9 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(f"DeepSeek request failed: {e}")
 
     calls, text = extract_tool_calls(reply.text, tools)
+    if DEBUG_REQUESTS:
+        log.warning("reply: calls=%s text=%r",
+                    [(c["function"]["name"], c["function"]["arguments"]) for c in calls or []],
+                    (text or "")[:200])
     return completion_response(req.model, text, prompt, reply.conversation_id,
                                tool_calls=calls)
