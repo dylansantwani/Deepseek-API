@@ -42,8 +42,9 @@ Rules, all of them mandatory:
 - Use ONLY tool names from the list. Never invent a tool that is not listed.
 - `arguments` must be a JSON object matching that tool's parameter schema.
 - NEVER write a call as prose or as code. Lines like "Action: some_tool",
-  "Action Input: {...}", or `some_tool({"arg": "value"})` are not tool calls
-  and do nothing. Only the JSON object above is a tool call.
+  "Action Input: {...}", `some_tool({"arg": "value"})`, or
+  `<some_tool arg="value">` are not tool calls and do nothing. Only the JSON
+  object above is a tool call.
 - NEVER write out, guess, or imagine a tool's result. Stop after the JSON; the
   real result comes back to you in the next turn.
 - NEVER announce a call in words. "I'll read the file now", "Let me check
@@ -249,6 +250,60 @@ def _extract_call_syntax(text: str, allowed: List[str]) -> Tuple[Optional[List[d
     return calls, leftover.strip()
 
 
+# Third salvage path: XML-ish dialects. `<tool_call>` wrappers appear when a
+# client's own prompt format leaks into the reply, and attribute form
+# (`<read_file path="a.txt">`) is what several agent frameworks train models to
+# emit. Both are only honoured for tools that were actually offered.
+_XML_TAG_RE = re.compile(r"<\s*([A-Za-z_][\w.\-]*)\s*((?:[\w.\-]+\s*=\s*\"[^\"]*\"\s*)*)/?>")
+_XML_ATTR_RE = re.compile(r"([\w.\-]+)\s*=\s*\"([^\"]*)\"")
+
+
+def _coerce(value: str):
+    """Turn an XML attribute string into a JSON scalar where it clearly is one."""
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return value
+    return parsed if isinstance(parsed, (int, float, bool, list, dict)) else value
+
+
+def _extract_xml_calls(text: str, allowed: List[str]) -> Tuple[Optional[List[dict]], str]:
+    """Parse `<tool_name attr="value">` and bare `<tool_call>name</tool_call>`."""
+    calls, spans = [], []
+    for m in _XML_TAG_RE.finditer(text):
+        tag, attrs = m.group(1), m.group(2)
+        name = _resolve_name(tag, allowed)
+        end = m.end()
+        if not name:
+            # A generic wrapper: the tool name is the tag's content instead.
+            if tag.lower() not in ("tool_call", "tool", "function_call", "invoke"):
+                continue
+            rest = text[m.end():]
+            inner = re.match(r"\s*([\w.\-]+)", rest)
+            if not inner:
+                continue
+            name = _resolve_name(inner.group(1), allowed)
+            if not name:
+                continue
+            end = m.end() + inner.end()
+            attrs = ""
+        args = {k: _coerce(v) for k, v in _XML_ATTR_RE.findall(attrs)}
+        calls.append({
+            "id": "call_" + uuid.uuid4().hex[:24],
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+        spans.append((m.start(), end))
+    if not calls:
+        return None, text
+    leftover = text
+    for start, stop in reversed(spans):
+        leftover = leftover[:start] + leftover[stop:]
+    # Tidy the now-orphaned closing tags.
+    leftover = re.sub(r"</\s*[\w.\-]+\s*>", "", leftover).strip()
+    return calls, leftover
+
+
 def _extract_react_calls(text: str, allowed: List[str]) -> Tuple[Optional[List[dict]], str]:
     """Parse ReAct-style `Action:` / `Action Input:` prose into tool calls."""
     calls, spans = [], []
@@ -408,15 +463,18 @@ def _normalise_calls(obj, allowed: List[str]) -> Optional[List[dict]]:
 
     calls = []
     for item in raw:
+        # Entries are validated INDIVIDUALLY and bad ones skipped. Failing the
+        # whole batch on one bad entry is how a valid `browser_tabs` call ends
+        # up rendered as raw JSON text next to an invented tool name.
         if not isinstance(item, dict):
-            return None
+            continue
         fn = item.get("function") if isinstance(item.get("function"), dict) else item
         name = fn.get("name")
         if not isinstance(name, str):
-            return None
+            continue
         name = _resolve_name(name, allowed) if allowed else name
         if not name:
-            return None
+            continue
         args = fn.get("arguments", fn.get("parameters", {}))
         if isinstance(args, str):
             try:
@@ -424,7 +482,7 @@ def _normalise_calls(obj, allowed: List[str]) -> Optional[List[dict]]:
             except (ValueError, TypeError):
                 args = {}
         if not isinstance(args, dict):
-            return None
+            continue
         calls.append({
             "id": "call_" + uuid.uuid4().hex[:24],
             "type": "function",
@@ -458,7 +516,10 @@ def extract_tool_calls(text: str, tools) -> Tuple[Optional[List[dict]], str]:
     calls, leftover = _extract_react_calls(text, allowed)
     if calls:
         return calls, leftover
-    return _extract_call_syntax(text, allowed)
+    calls, leftover = _extract_call_syntax(text, allowed)
+    if calls:
+        return calls, leftover
+    return _extract_xml_calls(text, allowed)
 
 
 def _now() -> int:

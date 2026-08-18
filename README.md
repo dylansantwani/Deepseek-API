@@ -257,13 +257,16 @@ has consequences worth knowing:
 
 - **It's best-effort.** A prompt is not a decoder constraint. Complex or deeply
   nested parameter schemas are where it frays first.
-- **Hallucinated tools are dropped.** A call naming a tool you didn't offer is
-  returned as ordinary text, never as a `tool_call`.
+- **Hallucinated tools are dropped, individually.** A call naming a tool you
+  didn't offer is returned as ordinary text, never as a `tool_call` — but only
+  that call. In a batch, the valid calls beside it still come through.
 - **Other call dialects are salvaged.** Models don't reliably follow the
   contract, so replies that narrate the call ReAct-style (`Action: some_tool` /
   `Action Input: {...}`) or write it as code (`some_tool({"arg": 1})`) are
   parsed into real calls anyway, including when the model drops a namespace
-  prefix. `deepseek-expert` prefers the code form.
+  prefix. XML forms (`<some_tool arg="value">`, `<tool_call>...</tool_call>`)
+  are handled too — they turn up when a client's own prompt format leaks into
+  the reply. `deepseek-expert` prefers the code form.
 - **Truncated replies are repaired structurally, never by guessing.** A cut-off
   object is closed so it can be parsed, but a half-written *value* is dropped
   with its key: `"tabId": 15` truncated from `1514652929` parses cleanly and

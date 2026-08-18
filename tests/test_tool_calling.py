@@ -276,3 +276,69 @@ def test_prompt_forbids_announcing_and_puts_contract_last():
     # leading with it is what made the expert model announce instead of call.
     assert prompt.index("browser_navigate") > prompt.index("You are helpful.")
     assert prompt.rstrip().endswith("Assistant:")
+
+
+# --- batches: one bad entry must not sink the valid ones -------------------
+
+def test_batch_keeps_valid_calls_when_one_name_is_invented():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"browser_navigate","arguments":{"url":"https://a.com"}},'
+        '{"name":"browser_get_all_pages","arguments":{}}]}', TOOLS)
+    assert _names(calls) == ["browser_navigate"]
+
+
+def test_batch_keeps_valid_calls_when_the_tail_is_truncated():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"browser_navigate","arguments":{"url":"https://a.com"}},'
+        '{"name":"browser_nav', TOOLS)
+    assert _names(calls) == ["browser_navigate"]
+
+
+def test_batch_of_only_invalid_calls_stays_text():
+    calls, _ = extract_tool_calls('{"tool_calls":[{"name":"nope","arguments":{}}]}', TOOLS)
+    assert calls is None
+
+
+def test_multiple_valid_calls_all_survive():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"browser_navigate","arguments":{"url":"https://a.com"}},'
+        '{"name":"browser_navigate","arguments":{"url":"https://b.com"}}]}', TOOLS)
+    assert len(calls) == 2
+
+
+# --- XML dialects ----------------------------------------------------------
+
+def test_xml_attribute_form():
+    calls, left = extract_tool_calls('<browser_navigate url="https://a.com">', TOOLS)
+    assert _args(calls)["url"] == "https://a.com"
+    assert left == ""
+
+
+def test_xml_self_closing_coerces_scalars():
+    calls, _ = extract_tool_calls('<browser_navigate url="https://a.com" depth="3"/>', TOOLS)
+    assert _args(calls) == {"url": "https://a.com", "depth": 3}
+
+
+def test_xml_tool_call_wrapper_around_json():
+    calls, _ = extract_tool_calls(
+        '<tool_call>{"name":"browser_navigate","arguments":{"url":"https://a.com"}}</tool_call>',
+        TOOLS)
+    assert _args(calls)["url"] == "https://a.com"
+
+
+def test_xml_tool_call_wrapper_with_bare_name():
+    calls, _ = extract_tool_calls("<tool_call>browser_navigate</tool_call>", TOOLS)
+    assert _names(calls) == ["browser_navigate"]
+    assert _args(calls) == {}
+
+
+def test_xml_wrapper_naming_something_that_isnt_a_tool_stays_text():
+    calls, _ = extract_tool_calls("<tool_call> some-skill-name", TOOLS)
+    assert calls is None
+
+
+def test_angle_brackets_in_prose_are_not_calls():
+    for text in ("Use a < b and c > d in your filter.",
+                 'The page had a <div class="x"> element.',
+                 "Compare <html> and <body> tags."):
+        assert extract_tool_calls(text, TOOLS)[0] is None
