@@ -412,6 +412,7 @@ def _repair_truncated(fragment: str) -> Optional[str]:
         repaired = re.sub(r',?\s*"[^"]*"\s*:\s*(?:-?\d+(?:\.\d*)?(?:[eE][-+]?\d*)?'
                           r'|t(?:r(?:u(?:e)?)?)?|f(?:a(?:l(?:s(?:e)?)?)?)?'
                           r'|n(?:u(?:l(?:l)?)?)?)?$', "", repaired)
+    repaired = re.sub(r"[\s`]*$", "", repaired)
     repaired = re.sub(r",\s*$", "", repaired)
     for opener in reversed(stack):
         repaired += "}" if opener == "{" else "]"
@@ -425,7 +426,14 @@ def _iter_json_candidates(text: str) -> Iterable[str]:
     object in the raw text, then a repaired tail if the reply was cut off.
     """
     for m in _FENCE_RE.finditer(text):
-        yield m.group(1)
+        # A fenced block can itself be truncated — the model closes the fence
+        # but never finishes the object. Offer the repaired form too, or a cut
+        # call inside a tidy ```json block never reaches the caller.
+        body = m.group(1)
+        yield body
+        repaired = _repair_truncated(body)
+        if repaired:
+            yield repaired
     partials = []
     i = 0
     while i < len(text):
@@ -443,6 +451,44 @@ def _iter_json_candidates(text: str) -> Iterable[str]:
         repaired = _repair_truncated(partial)
         if repaired:
             yield repaired
+
+
+# Generic wrapper names a model reaches for when it nests the real call one
+# level down: {"name": "tool_call", "arguments": {"name": <real>, ...}}.
+_WRAPPER_NAMES = ("tool_call", "tool", "function", "function_call", "invoke", "call")
+
+
+def _unwrap_call(fn: dict, allowed: List[str], depth: int = 0) -> Optional[dict]:
+    """Peel generic wrappers off a call entry until the real one is found.
+
+    Models sometimes echo the protocol's own vocabulary as the tool name and
+    nest the actual call inside `arguments`. The inner call is a perfectly good
+    one, so dig it out instead of dropping the entry (and, with it, every other
+    call in the same batch).
+    """
+    if depth > 3 or not isinstance(fn, dict):
+        return None
+    name = fn.get("name")
+    if not isinstance(name, str):
+        return None
+    args = fn.get("arguments", fn.get("parameters", {}))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args or "{}")
+        except (ValueError, TypeError):
+            args = {}
+    if not isinstance(args, dict):
+        return None
+
+    resolved = _resolve_name(name, allowed) if allowed else name
+    # A nested call wins over a wrapper name, even one that happens to resolve.
+    if isinstance(args.get("name"), str) and (not resolved or name.lower() in _WRAPPER_NAMES):
+        inner = _unwrap_call(args, allowed, depth + 1)
+        if inner:
+            return inner
+    if not resolved:
+        return None
+    return {"name": resolved, "arguments": args}
 
 
 def _normalise_calls(obj, allowed: List[str]) -> Optional[List[dict]]:
@@ -469,20 +515,10 @@ def _normalise_calls(obj, allowed: List[str]) -> Optional[List[dict]]:
         if not isinstance(item, dict):
             continue
         fn = item.get("function") if isinstance(item.get("function"), dict) else item
-        name = fn.get("name")
-        if not isinstance(name, str):
+        unwrapped = _unwrap_call(fn, allowed)
+        if not unwrapped:
             continue
-        name = _resolve_name(name, allowed) if allowed else name
-        if not name:
-            continue
-        args = fn.get("arguments", fn.get("parameters", {}))
-        if isinstance(args, str):
-            try:
-                args = json.loads(args or "{}")
-            except (ValueError, TypeError):
-                args = {}
-        if not isinstance(args, dict):
-            continue
+        name, args = unwrapped["name"], unwrapped["arguments"]
         calls.append({
             "id": "call_" + uuid.uuid4().hex[:24],
             "type": "function",

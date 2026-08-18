@@ -342,3 +342,50 @@ def test_angle_brackets_in_prose_are_not_calls():
                  'The page had a <div class="x"> element.',
                  "Compare <html> and <body> tags."):
         assert extract_tool_calls(text, TOOLS)[0] is None
+
+
+# --- nested wrappers and truncated fenced blocks ---------------------------
+
+def test_nested_tool_call_wrapper_is_unwrapped():
+    # The model echoes the protocol's own vocabulary as the tool name and nests
+    # the real call inside `arguments`.
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"tool_call","arguments":'
+        '{"name":"browser_navigate","arguments":{"url":"https://a.com"}}}]}', TOOLS)
+    assert _names(calls) == ["browser_navigate"]
+    assert _args(calls)["url"] == "https://a.com"
+
+
+def test_deeply_nested_wrappers_are_unwrapped():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"function","arguments":{"name":"tool_call","arguments":'
+        '{"name":"browser_navigate","arguments":{"url":"https://a.com"}}}}]}', TOOLS)
+    assert _names(calls) == ["browser_navigate"]
+
+
+def test_wrapper_around_an_unoffered_tool_stays_text():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls":[{"name":"tool_call","arguments":'
+        '{"name":"delete_everything","arguments":{}}}]}', TOOLS)
+    assert calls is None
+
+
+def test_truncated_fenced_block_is_repaired():
+    # The model closes the fence but never finishes the object.
+    calls, _ = extract_tool_calls(
+        '```json\n{"tool_calls": [{"name": "browser_navigate", '
+        '"arguments": {"url": "https://a.com"}}\n```', TOOLS)
+    assert _args(calls)["url"] == "https://a.com"
+
+
+def test_truncated_fenced_nested_wrapper_the_real_world_case():
+    calls, _ = extract_tool_calls(
+        '```json\n{"tool_calls": [{"name": "tool_call", "arguments": '
+        '{"name": "browser_navigate", "arguments": {"url": "https://mail.google.com"}}}\n```',
+        TOOLS)
+    assert _names(calls) == ["browser_navigate"]
+    assert _args(calls)["url"] == "https://mail.google.com"
+
+
+def test_fenced_non_call_json_stays_text():
+    assert extract_tool_calls('```json\n{"note": "nothing here"}\n```', TOOLS)[0] is None

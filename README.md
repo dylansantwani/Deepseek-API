@@ -267,6 +267,8 @@ has consequences worth knowing:
   prefix. XML forms (`<some_tool arg="value">`, `<tool_call>...</tool_call>`)
   are handled too — they turn up when a client's own prompt format leaks into
   the reply. `deepseek-expert` prefers the code form.
+- **Nested wrappers are unwrapped.** A model that names the tool `tool_call` and
+  nests the real call inside `arguments` still gets a working call.
 - **Truncated replies are repaired structurally, never by guessing.** A cut-off
   object is closed so it can be parsed, but a half-written *value* is dropped
   with its key: `"tabId": 15` truncated from `1514652929` parses cleanly and
