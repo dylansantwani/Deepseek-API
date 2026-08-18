@@ -284,6 +284,15 @@ has consequences worth knowing:
   complete, so tool-enabled streaming requests emit one delta instead of
   token-by-token output. Requests without `tools` stream as before.
 
+- **Replies are cut at the first role label.** The prompt serialises the
+  conversation with `User:` / `Assistant:` / `Tool result (...)` labels, and a
+  model will happily keep writing past its own turn — inventing the tool result
+  and the next question. Everything after the first label is dropped, so a
+  fabricated result can never reach the caller as if it were real.
+- **Calls survive a malformed envelope.** If the `{"tool_calls": [...]}` wrapper
+  itself is broken (an array that never closes), the well-formed call objects
+  inside it are still recovered.
+
 Set `DEBUG_REQUESTS=1` to log each request's message roles and offered tool
 names — the quickest way to tell whether a client actually sent `tools`.
 

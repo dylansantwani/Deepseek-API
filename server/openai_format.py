@@ -514,6 +514,7 @@ def _normalise_calls(obj, allowed: List[str], strict: bool = True) -> Optional[L
     passes strict=False, because the intent to call is unambiguous and the name
     may simply not be in this request's `tools` array.
     """
+    wrapped = isinstance(obj, dict) and ("tool_calls" in obj or "tool_call" in obj)
     if isinstance(obj, dict):
         raw = obj.get("tool_calls") or obj.get("tool_call") or obj
     else:
@@ -531,6 +532,12 @@ def _normalise_calls(obj, allowed: List[str], strict: bool = True) -> Optional[L
         if not isinstance(item, dict):
             continue
         fn = item.get("function") if isinstance(item.get("function"), dict) else item
+        # With no `tool_calls` wrapper to signal intent, require the entry to
+        # actually look like a call. Otherwise any JSON object with a "name" --
+        # a config blob quoted in prose -- becomes one.
+        if not wrapped and not isinstance(
+                fn.get("arguments", fn.get("parameters")), dict):
+            continue
         unwrapped = _unwrap_call(fn, allowed, strict=strict)
         if not unwrapped:
             continue
@@ -546,6 +553,67 @@ def _normalise_calls(obj, allowed: List[str], strict: bool = True) -> Optional[L
     return calls or None
 
 
+def _extract_inner_calls(text: str, allowed: List[str]) -> Tuple[Optional[List[dict]], str]:
+    """Pick individual call objects out of a malformed envelope.
+
+    The wrapper itself can be broken in ways no repair should guess at — an
+    array that never closes, a stray brace — while the call objects inside it
+    are perfectly well-formed. Rather than lose them, scan for objects carrying
+    both a string `name` and an `arguments`/`parameters` mapping, which is
+    specific enough that ordinary JSON in prose doesn't qualify.
+    """
+    calls, spans, i = [], [], 0
+    while i < len(text):
+        if text[i] != "{":
+            i += 1
+            continue
+        complete, partial = _scan_object(text, i)
+        frag = complete or _repair_truncated(partial or "") or ""
+        obj = None
+        if frag:
+            try:
+                obj = json.loads(frag)
+            except (ValueError, TypeError):
+                obj = None
+        if (isinstance(obj, dict) and isinstance(obj.get("name"), str)
+                and isinstance(obj.get("arguments", obj.get("parameters")), dict)):
+            one = _normalise_calls([obj], allowed, strict=False)
+            if one:
+                calls.extend(one)
+                spans.append((i, i + len(frag)))
+                i += len(frag)
+                continue
+        i += 1
+    if not calls:
+        return None, text
+    leftover = text
+    for start, stop in reversed(spans):
+        leftover = leftover[:start] + leftover[stop:]
+    leftover = re.sub(r"```(?:json)?", "", leftover)
+    leftover = re.sub(r'[\s,\[\]{}]*$', "", leftover).strip()
+    return calls, leftover
+
+
+# The prompt serialises the conversation with role labels, so the model can
+# just... keep going: emit a call, then write the "Tool result (...)" line and
+# the next user turn itself. Everything past its own turn is fabricated -- most
+# dangerously an invented tool result -- so the reply is cut at the first label.
+_ROLE_BOUNDARY_RE = re.compile(
+    r"^\s*(?:Tool result\s*\(|User\s*:|System\s*:|Assistant\s*:|Human\s*:)",
+    re.MULTILINE,
+)
+
+
+def trim_at_role_boundary(text: str) -> str:
+    """Drop any continuation past the model's own turn."""
+    if not text:
+        return text
+    m = _ROLE_BOUNDARY_RE.search(text)
+    if not m or m.start() == 0:
+        return text
+    return text[:m.start()].rstrip()
+
+
 def extract_tool_calls(text: str, tools) -> Tuple[Optional[List[dict]], str]:
     """Split a reply into (tool_calls, leftover_text).
 
@@ -555,6 +623,7 @@ def extract_tool_calls(text: str, tools) -> Tuple[Optional[List[dict]], str]:
     allowed = tool_names(tools)
     if not allowed or not text:
         return None, text
+    text = trim_at_role_boundary(text)
     for candidate in _iter_json_candidates(text):
         try:
             obj = json.loads(candidate)
@@ -565,6 +634,9 @@ def extract_tool_calls(text: str, tools) -> Tuple[Optional[List[dict]], str]:
             leftover = text.replace(candidate, "", 1)
             leftover = _FENCE_RE.sub("", leftover).strip()
             return calls, leftover
+    calls, leftover = _extract_inner_calls(text, allowed)
+    if calls:
+        return calls, leftover
     calls, leftover = _extract_react_calls(text, allowed)
     if calls:
         return calls, leftover

@@ -45,6 +45,7 @@ from .config import (
 from .openai_format import (
     completion_response,
     extract_tool_calls,
+    trim_at_role_boundary,
     messages_to_prompt,
     stream_chunks,
     stream_chunks_with_tools,
@@ -172,6 +173,10 @@ async def chat_completions(req: ChatCompletionRequest):
         return _error(f"DeepSeek request failed: {e}")
 
     calls, text = extract_tool_calls(reply.text, tools)
+    if not tools:
+        # No tools this turn, so extract_tool_calls returned early — the reply
+        # can still run on past its turn, so trim it here too.
+        text = trim_at_role_boundary(text)
     if DEBUG_REQUESTS:
         log.warning("reply: calls=%s text=%r",
                     [(c["function"]["name"], c["function"]["arguments"]) for c in calls or []],

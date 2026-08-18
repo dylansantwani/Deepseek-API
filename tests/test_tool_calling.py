@@ -10,7 +10,11 @@ import json
 from fastapi.testclient import TestClient
 
 import server.api as api
-from server.openai_format import extract_tool_calls, messages_to_prompt
+from server.openai_format import (
+    extract_tool_calls,
+    messages_to_prompt,
+    trim_at_role_boundary,
+)
 from server.schemas import ChatMessage
 
 TOOLS = [{"type": "function", "function": {
@@ -416,3 +420,52 @@ def test_truncated_fenced_nested_wrapper_the_real_world_case():
 
 def test_fenced_non_call_json_stays_text():
     assert extract_tool_calls('```json\n{"note": "nothing here"}\n```', TOOLS)[0] is None
+
+
+# --- the model running past its own turn -----------------------------------
+
+def test_fabricated_continuation_is_trimmed():
+    # The prompt uses role labels, so the model will happily write the tool
+    # result and the next turn itself. Everything past its turn is invented.
+    calls, left = extract_tool_calls(
+        '{"tool_calls": [{"name": "browser_navigate", "arguments": {"url": "https://a.com"}}]}\n'
+        "\nTool result (browser_navigate): opened tab 123\n"
+        "\nAssistant: I opened it and the page loaded.", TOOLS)
+    assert _names(calls) == ["browser_navigate"]
+    assert "Tool result" not in (left or "")
+    assert "opened tab 123" not in (left or "")
+
+
+def test_trim_leaves_ordinary_prose_alone():
+    for text in ("The inbox shows 32 unread messages.",
+                 "Here is the result: 5 tabs open.",
+                 "Assistant: is a word that can start a sentence."):
+        assert trim_at_role_boundary(text) == text
+
+
+# --- malformed envelopes ---------------------------------------------------
+
+def test_calls_survive_an_envelope_whose_array_never_closes():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls": [{"name": "browser_navigate", "arguments": {"url": "https://a.com"}}}', TOOLS)
+    assert _args(calls)["url"] == "https://a.com"
+
+
+def test_multiple_calls_survive_a_broken_envelope():
+    calls, _ = extract_tool_calls(
+        '{"tool_calls": [{"name": "browser_navigate", "arguments": {"url": "https://a.com"}},'
+        '{"name": "browser_navigate", "arguments": {"url": "https://b.com"}}}', TOOLS)
+    assert len(calls) == 2
+
+
+def test_json_quoted_in_prose_is_not_a_call():
+    # A bare object needs to look like a call; a "name" alone isn't enough.
+    calls, _ = extract_tool_calls(
+        'The config was {"name": "widget", "size": 3} which I updated.', TOOLS)
+    assert calls is None
+
+
+def test_bare_object_with_arguments_is_a_call():
+    calls, _ = extract_tool_calls(
+        '{"name": "browser_navigate", "arguments": {"url": "https://a.com"}}', TOOLS)
+    assert _names(calls) == ["browser_navigate"]
