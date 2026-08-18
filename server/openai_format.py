@@ -13,6 +13,7 @@ some_tool ...") and the caller sees text where it expected a tool call.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
@@ -229,10 +230,7 @@ def _extract_call_syntax(text: str, allowed: List[str]) -> Tuple[Optional[List[d
             obj, partial = _scan_object(text, end)
             if not obj:
                 obj = _repair_truncated(partial or "") or ""
-            try:
-                args = json.loads(obj)
-            except (ValueError, TypeError):
-                continue
+            args = _loads(obj)
             if not isinstance(args, dict):
                 continue
             end += len(obj)
@@ -331,6 +329,26 @@ def _extract_react_calls(text: str, allowed: List[str]) -> Tuple[Optional[List[d
     for start, end in reversed(spans):
         leftover = leftover[:start] + leftover[end:]
     return calls, leftover.strip()
+
+
+def _loads(fragment: str):
+    """Parse a JSON object, falling back to Python literal syntax.
+
+    Models emit Python dict repr as readily as JSON — `{'tool_calls': [...]}`
+    with single quotes, `True`/`None` — which `json.loads` rejects outright.
+    `ast.literal_eval` handles literals only (no calls, no names), so this
+    stays a parser and never becomes an evaluator.
+    """
+    if not fragment:
+        return None
+    try:
+        return json.loads(fragment)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return ast.literal_eval(fragment)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
 
 
 def _scan_object(text: str, start: int) -> Tuple[Optional[str], Optional[str]]:
@@ -569,12 +587,7 @@ def _extract_inner_calls(text: str, allowed: List[str]) -> Tuple[Optional[List[d
             continue
         complete, partial = _scan_object(text, i)
         frag = complete or _repair_truncated(partial or "") or ""
-        obj = None
-        if frag:
-            try:
-                obj = json.loads(frag)
-            except (ValueError, TypeError):
-                obj = None
+        obj = _loads(frag) if frag else None
         if (isinstance(obj, dict) and isinstance(obj.get("name"), str)
                 and isinstance(obj.get("arguments", obj.get("parameters")), dict)):
             one = _normalise_calls([obj], allowed, strict=False)
@@ -625,9 +638,8 @@ def extract_tool_calls(text: str, tools) -> Tuple[Optional[List[dict]], str]:
         return None, text
     text = trim_at_role_boundary(text)
     for candidate in _iter_json_candidates(text):
-        try:
-            obj = json.loads(candidate)
-        except (ValueError, TypeError):
+        obj = _loads(candidate)
+        if obj is None:
             continue
         calls = _normalise_calls(obj, allowed, strict=False)
         if calls:

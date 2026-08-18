@@ -526,3 +526,42 @@ def test_other_upstream_errors_become_502():
     r = c.post("/v1/chat/completions", json={
         "model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]})
     assert r.status_code == 502
+
+
+def test_prefetched_stream_does_not_duplicate_the_first_delta():
+    # The endpoint pulls one delta to surface upstream errors as a status code.
+    # That delta must not also be replayed by re-iterating the stream.
+    class _S:
+        conversation_id = "conv-1"
+
+        def __init__(self):
+            self.parts = ["I", "'ll", " go"]
+
+        def __iter__(self):
+            return iter(self.parts)
+
+    raw = _S()
+    it = iter(raw)
+    first = next(it, None)
+    assert "".join(api._Prefetched(raw, it, first)) == "I'll go"
+
+
+# --- Python dict repr ------------------------------------------------------
+
+def test_python_dict_repr_is_parsed():
+    # Models emit Python repr as readily as JSON; json.loads rejects it outright.
+    calls, _ = extract_tool_calls(
+        "{'tool_calls': [{'name': 'browser_navigate', "
+        "'arguments': {'url': 'https://a.com'}}]}", TOOLS)
+    assert _args(calls)["url"] == "https://a.com"
+
+
+def test_python_literals_are_coerced():
+    calls, _ = extract_tool_calls(
+        "{'tool_calls': [{'name': 'browser_navigate', "
+        "'arguments': {'url': 'https://a.com', 'full': True, 'sel': None}}]}", TOOLS)
+    assert _args(calls) == {"url": "https://a.com", "full": True, "sel": None}
+
+
+def test_python_repr_in_prose_is_not_a_call():
+    assert extract_tool_calls("It printed {'a': 1} to the console.", TOOLS)[0] is None

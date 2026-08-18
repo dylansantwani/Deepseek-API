@@ -124,13 +124,17 @@ class _Prefetched:
     instead of a 200 whose body turns out to be an error mid-flight.
     """
 
-    def __init__(self, stream, first):
-        self._stream, self._first = stream, first
+    def __init__(self, stream, iterator, first):
+        # `iterator` is the ALREADY-ADVANCED iterator, not the stream object.
+        # Re-iterating the stream replays it from the beginning, which silently
+        # duplicates the prefetched delta ("II'll..." instead of "I'll...") and
+        # can corrupt a tool call whose reply starts with `{`.
+        self._stream, self._iter, self._first = stream, iterator, first
 
     def __iter__(self):
         if self._first is not None:
             yield self._first
-        yield from self._stream
+        yield from self._iter
 
     @property
     def conversation_id(self):
@@ -203,7 +207,7 @@ async def chat_completions(req: ChatCompletionRequest):
             return _error(f"DeepSeek request failed: {e}")
 
         def gen():
-            stream = _Prefetched(raw, first)
+            stream = _Prefetched(raw, it, first)
             if tools:
                 yield from stream_chunks_with_tools(req.model, stream, tools)
             else:
